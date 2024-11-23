@@ -8,6 +8,7 @@ precomputed.
 """
 import torch
 import math
+import einops
 from torch import nn
 
 class PE2D(nn.Module):
@@ -45,32 +46,35 @@ class PE2D(nn.Module):
         # Concat and also already add a batch axis which can then be broadcasted automatically
         # in the forward function.
         pe_2d = torch.cat([pe_h, pe_w], dim=-1).unsqueeze(0) #(1, h, w, dim)
+
+        # TODO, this could be handled better by putting the dimension in the front from the start.
+        pe_2d = einops.rearrange(pe_2d, "b h w c -> b c h w")
         self.register_buffer("_pe_2d", pe_2d)
 
     def forward(self, x: torch.tensor) -> torch.Tensor:
         """Positionally encode image batch.
 
         Args:
-            x: Image batch of shape (B, H, W, C)
+            x: Image batch of shape (B, C, H, W)
 
         Returns:
-            Image batch with PEs summed at every location. Shape (B, H, W, C).
+            Image batch with PEs summed at every location. Shape (B, C, H, W).
         """
         return x + self._pe_2d
 
 if __name__ == "__main__":
-    h, w = 100, 100
-    d = 32
+    h, w = 400, 400
+    d = 16
     pe = PE2D(h, w, d, max_fq=1e4)
 
     # Test that it works.
-    pe(torch.randn(10, 100, 100, 32))
+    pe(torch.randn(10, d, h, w))
     
     # Plot some PEs
-    pe_h = pe._pe_2d[0, :, 0, :d//4]
+    pe_h = pe._pe_2d[0, :d//4, :, 0]
     import matplotlib.pyplot as plt
     for i in range(d//4):
-        plt.plot(torch.arange(h), pe_h[..., i])
+        plt.plot(torch.arange(h), pe_h[i, :])
     # Verify correctness, 7/8 comes from 32//4 and then the fact that arange stops at 1 off the end.
     #plt.plot(torch.arange(h), pe_h[..., d//4 - 1])
     #plt.plot(torch.arange(h), torch.sin(torch.arange(h)/(10000**(7/8))))
