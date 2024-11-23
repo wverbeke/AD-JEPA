@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from math import pi
 import einops
+from pe import PE2D
 
 
 class MHA(nn.Module):
@@ -23,8 +24,7 @@ class MHA(nn.Module):
         In this case we do not need the sequence length since the pytorch flash attention
         implementation is dynamic w.r.t. the sequence length.
         """
-        assert dim_query_out % n_heads == 0
-        assert dim_value_out % n_heads == 0
+        assert dim_out % n_heads == 0
         assert 1 > dropout_p >= 0, "dropout_p must be a probability smaller than 1."
         super().__init__()
 
@@ -41,7 +41,7 @@ class MHA(nn.Module):
         self._key_transf = nn.Linear(dim_kv_in, dim_out, bias=bias)
         self._value_transf = nn.Linear(dim_kv_in, dim_out, bias=bias)
 
-        self._out_transf = nn.Linear(dim_value_out, dim_out, bias=True)
+        self._out_transf = nn.Linear(dim_out, dim_out, bias=True)
         self._dropout_p = dropout_p
 
     def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
@@ -92,10 +92,10 @@ class DropPath(nn.Module):
             output = torch.div(x, keep_p) * threshold
             return output
 
-        self._drop = lambda x, t: _drop_path(x, drop_p=drop_p, training=t) if drop_p > 0 else nn.Identity()
+        self._drop = (lambda x, t: _drop_path(x, drop_p=drop_p, training=t)) if drop_p > 0 else (lambda x, t: x)
 
     def forward(self, x: torch.Tensor):
-        return self._drop(x)
+        return self._drop(x, self.training)
 
 
 class MLP(nn.Module):
@@ -111,8 +111,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # Only apply activation in expanded space.
-        x = x + self._do(torch.nn.functional.gelu(self._lin_1(x)))
-        x = x + self._do(self._lin_2(x))
+        x = self._do(torch.nn.functional.gelu(self._lin_1(x)))
+        return self._do(self._lin_2(x))
 
 
 class SelfAttentionBlock(nn.Module):
@@ -144,25 +144,50 @@ class SelfAttentionBlock(nn.Module):
         """Forward pass."""
         normed = self._ln_attn(x)
         x = x + self._drop_path(self._attn(normed, normed))
-        x = x + self._drop_path(self._ffn(x))
+        normed = self._ln_ffn(x)
+        x = x + self._drop_path(self._ffn(normed))
         return x
 
 
 # TODO: For very large image sizes we might need to run a somewhat more substantial CNN before
 # going into the transformer to not get hit too much by the O(N^2) scaling in the number of pixels.
 class Patchify(nn.Module):
-    """Patchify an image and encode it to a sequence."""
+    """Patchify an image."""
     def __init__(self, im_h: int, im_w: int, patch_h: int, patch_w: int, dim: int):
         assert im_h % patch_h == 0, "Image and patch heights must be divisible."
         assert im_w % patch_w == 0, "Image and patch widths must be divisible."
         super().__init__()
-        self._proj = nn.Conv2D(3, dim, kernel_size=(path_h, patch_w), stride=(patch_h, patch_w))
+        self._proj = nn.Conv2d(3, dim, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
 
     def forward(self, x: torch.Tensor):
-        return einops.rearrange(self._proj(x), "b c h w -> b (h w) c")
+        return self._proj(x)
 
 
+class ViT(nn.Module):
+    """Vision Transformer."""
+    def __init__(self, dim: int, im_h: int, im_w: int, patch_h: int, patch_w: int, n_layers: int, drop_path_p: float, **attn_kwargs):
+        """Initialize."""
+        super().__init__()
+        self._patchifier = Patchify(im_h=im_h, im_w=im_w, patch_h=patch_h, patch_w=patch_w, dim=dim)
+        self._pe = PE2D(height=im_h//patch_h, width=im_w//patch_w, dim=dim, max_fq=1e4)
 
-#class ViT(nn.Module):
-#    """Vision Transformer."""
-#    def __init__(self, dim: 
+        # The later the layer comes, the higher the probability it gets randomly dropped.
+        # This should force each layer to have predictive power to some extent.
+        drop_path_ps = torch.linspace(0, drop_path_p, n_layers)
+        self._attn_layers = nn.ModuleList(SelfAttentionBlock(dim=dim, drop_path_p=dpp.item(), n_heads=8, **attn_kwargs) for dpp in drop_path_ps)
+        self._ln_out = nn.LayerNorm([dim])
+
+    def forward(self, x: torch.Tensor):
+        assert len(x.shape) == 4, "A batch of images must be a 4D tensor."
+        x = self._patchifier(x)
+        print(f"{x.shape=}")
+        x = x + self._pe(x)
+        x = einops.rearrange(x, "b c h w -> b (h w) c")
+        for attn in self._attn_layers:
+            x = attn(x)
+        return self._ln_out(x)
+
+if __name__ =="__main__":
+    vit = ViT(64, 100, 100, 10, 10, 6, 0.5)
+    x = torch.randn(2, 3, 100, 100)
+    out = vit(x)
